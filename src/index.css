@@ -7,11 +7,6 @@
     --text-color: #f8fafc;
 }
 
-html {
-    font-size: 85%;
-    /* Scales down UI to ~13.6px base size */
-}
-
 body {
     margin: 0;
     padding: 0;
@@ -48,8 +43,10 @@ body {
 
 .container {
     text-align: center;
-    width: 100%;
-    min-height: 100vh;
+    width: 125%;
+    /* Compensate for scale(0.8) -> 100 / 0.8 = 125% */
+    min-height: 125vh;
+    /* Compensate for scale(0.8) */
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -58,6 +55,8 @@ body {
     position: relative;
     z-index: 1;
     box-sizing: border-box;
+    transform: scale(0.8);
+    transform-origin: center center;
 }
 
 .card {
