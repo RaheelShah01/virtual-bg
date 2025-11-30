@@ -7,6 +7,11 @@
     --text-color: #f8fafc;
 }
 
+html {
+    font-size: 85%;
+    /* Scales down UI to ~13.6px base size */
+}
+
 body {
     margin: 0;
     padding: 0;
