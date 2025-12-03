@@ -14,6 +14,7 @@ function App() {
     const selfieSegmentationRef = useRef(null);
     const backgroundImagesRef = useRef([]);
     const requestRef = useRef(null);
+    const maskCanvasRef = useRef(null);
 
     // Refs for values accessed in onResults (to avoid stale closure)
     const selectedBgIndexRef = useRef(-1);
@@ -118,8 +119,11 @@ function App() {
             }
         });
 
+        const isMobile = window.innerWidth < 768;
+        console.log(`[DEBUG] Device detected as ${isMobile ? 'Mobile' : 'PC'}. Using modelSelection: ${isMobile ? 0 : 1}`);
+
         await selfieSegmentation.setOptions({
-            modelSelection: 1,
+            modelSelection: isMobile ? 0 : 1,
             selfieMode: true,
         });
 
@@ -168,8 +172,37 @@ function App() {
 
         if (currentBgIndex >= 0 || currentBlur) {
             ctx.globalCompositeOperation = 'destination-in';
-            ctx.filter = 'contrast(1.2) brightness(0.9)';
-            ctx.drawImage(results.segmentationMask, 0, 0, width, height);
+
+            const isMobile = window.innerWidth < 768;
+
+            if (!isMobile) {
+                // Geometric erosion (offset intersection) to remove whitish halo
+                // Only on PC. Skipped on mobile for performance/preference.
+                if (!maskCanvasRef.current) {
+                    maskCanvasRef.current = document.createElement('canvas');
+                }
+                const maskCanvas = maskCanvasRef.current;
+                maskCanvas.width = width;
+                maskCanvas.height = height;
+                const mCtx = maskCanvas.getContext('2d');
+
+                // Draw original mask
+                mCtx.drawImage(results.segmentationMask, 0, 0, width, height);
+
+                // Intersect with shifted versions (erosion)
+                // Shift Left/Right/Down only. NOT Up (0, -offset), to preserve bottom edge.
+                mCtx.globalCompositeOperation = 'destination-in';
+                const offset = 2; // Approx 2px erosion
+                mCtx.drawImage(results.segmentationMask, -offset, 0, width, height); // Erodes Right
+                mCtx.drawImage(results.segmentationMask, offset, 0, width, height);  // Erodes Left
+                mCtx.drawImage(results.segmentationMask, 0, offset, width, height);  // Erodes Top
+
+                // Use the eroded mask
+                ctx.drawImage(maskCanvas, 0, 0, width, height);
+            } else {
+                // Mobile: Use original mask directly (no erosion)
+                ctx.drawImage(results.segmentationMask, 0, 0, width, height);
+            }
             ctx.filter = 'none';
 
             ctx.globalCompositeOperation = 'destination-over';
@@ -177,10 +210,29 @@ function App() {
             if (currentBgIndex >= 0 && currentBgIndex < backgroundImagesRef.current.length) {
                 const bgImage = backgroundImagesRef.current[currentBgIndex];
 
+                // Calculate crop to maintain aspect ratio (cover)
+                const imgAspect = bgImage.width / bgImage.height;
+                const canvasAspect = width / height;
+                let sx, sy, sWidth, sHeight;
+
+                if (imgAspect > canvasAspect) {
+                    // Image is wider than canvas: crop sides
+                    sHeight = bgImage.height;
+                    sWidth = sHeight * canvasAspect;
+                    sy = 0;
+                    sx = (bgImage.width - sWidth) / 2;
+                } else {
+                    // Image is taller than canvas: crop top/bottom
+                    sWidth = bgImage.width;
+                    sHeight = sWidth / canvasAspect;
+                    sx = 0;
+                    sy = (bgImage.height - sHeight) / 2;
+                }
+
                 if (currentBlur) {
                     ctx.filter = `blur(${BLUR_AMOUNT}px)`;
                 }
-                ctx.drawImage(bgImage, 0, 0, width, height);
+                ctx.drawImage(bgImage, sx, sy, sWidth, sHeight, 0, 0, width, height);
                 ctx.filter = 'none';
             } else if (currentBlur) {
                 ctx.filter = `blur(${BLUR_AMOUNT}px)`;
