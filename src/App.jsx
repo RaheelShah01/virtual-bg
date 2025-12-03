@@ -7,6 +7,7 @@ function App() {
     const [selectedBgIndex, setSelectedBgIndex] = useState(-1);
     const [applyBlur, setApplyBlur] = useState(false);
     const [errorMsg, setErrorMsg] = useState('');
+    const [videoLoaded, setVideoLoaded] = useState(false);
 
     // Refs
     const videoRef = useRef(null);
@@ -15,13 +16,14 @@ function App() {
     const backgroundImagesRef = useRef([]);
     const requestRef = useRef(null);
     const maskCanvasRef = useRef(null);
+    const bgCanvasRef = useRef(null);
 
     // Refs for values accessed in onResults (to avoid stale closure)
     const selectedBgIndexRef = useRef(-1);
     const applyBlurRef = useRef(false);
 
     // Constants
-    const BLUR_AMOUNT = 25;
+    const BLUR_AMOUNT = 20; // Reduced slightly for CSS blur
 
     // Cleanup on unmount
     useEffect(() => {
@@ -65,18 +67,30 @@ function App() {
     };
 
     const startWebcam = async () => {
+        // Relaxed constraints for Android compatibility
         const stream = await navigator.mediaDevices.getUserMedia({
-            video: { width: 1280, height: 720 },
+            video: { facingMode: 'user' },
             audio: false
         });
 
         if (videoRef.current) {
             videoRef.current.srcObject = stream;
             return new Promise((resolve) => {
-                videoRef.current.onloadedmetadata = () => {
-                    videoRef.current.play();
+                const onLoaded = () => {
+                    console.log('[DEBUG] Video metadata loaded');
+                    videoRef.current.play().catch(e => console.error('Play error:', e));
                     resolve();
                 };
+                videoRef.current.onloadedmetadata = onLoaded;
+
+                // Fallback: If metadata doesn't load quickly, try to play anyway
+                setTimeout(() => {
+                    if (videoRef.current && videoRef.current.paused) {
+                        console.log('[DEBUG] Forcing video play after timeout...');
+                        videoRef.current.play().catch(e => console.error('Force play error:', e));
+                        resolve();
+                    }
+                }, 1000);
             });
         }
     };
@@ -148,97 +162,112 @@ function App() {
         const currentBgIndex = selectedBgIndexRef.current;
         const currentBlur = applyBlurRef.current;
 
-        console.log('[onResults] Callback fired', {
-            imageSize: `${results.image.width}x${results.image.height}`,
-            hasMask: !!results.segmentationMask,
-            selectedBg: currentBgIndex,
-            blur: currentBlur
-        });
+        // Mark video as loaded on first frame
+        if (!videoLoaded) {
+            setVideoLoaded(true);
+        }
 
         const canvas = canvasRef.current;
+        const bgCanvas = bgCanvasRef.current;
         const ctx = canvas?.getContext('2d');
-        if (!canvas || !ctx) return;
+        const bgCtx = bgCanvas?.getContext('2d');
+
+        if (!canvas || !ctx || !bgCanvas || !bgCtx) return;
 
         const width = results.image.width;
         const height = results.image.height;
 
-        canvas.width = width;
-        canvas.height = height;
+        // Resize canvases if needed
+        if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+            bgCanvas.width = width;
+            bgCanvas.height = height;
+        }
 
+        // --- Layer 1: Background Canvas ---
+        bgCtx.save();
+        bgCtx.clearRect(0, 0, width, height);
+
+        // Apply CSS blur to the background canvas element itself
+        if (currentBlur) {
+            bgCanvas.style.filter = `blur(${BLUR_AMOUNT}px)`;
+        } else {
+            bgCanvas.style.filter = 'none';
+        }
+
+        if (currentBgIndex >= 0 && currentBgIndex < backgroundImagesRef.current.length) {
+            // Draw Virtual Background
+            const bgImage = backgroundImagesRef.current[currentBgIndex];
+
+            // Calculate crop to maintain aspect ratio (cover)
+            const imgAspect = bgImage.width / bgImage.height;
+            const canvasAspect = width / height;
+            let sx, sy, sWidth, sHeight;
+
+            if (imgAspect > canvasAspect) {
+                sHeight = bgImage.height;
+                sWidth = sHeight * canvasAspect;
+                sy = 0;
+                sx = (bgImage.width - sWidth) / 2;
+            } else {
+                sWidth = bgImage.width;
+                sHeight = sWidth / canvasAspect;
+                sx = 0;
+                sy = (bgImage.height - sHeight) / 2;
+            }
+            bgCtx.drawImage(bgImage, sx, sy, sWidth, sHeight, 0, 0, width, height);
+        } else {
+            // Draw Camera Feed (for blur only mode or no effect)
+            bgCtx.drawImage(results.image, 0, 0, width, height);
+        }
+        bgCtx.restore();
+
+
+        // --- Layer 2: Foreground Canvas (Person) ---
         ctx.save();
         ctx.clearRect(0, 0, width, height);
 
-        ctx.drawImage(results.image, 0, 0, width, height);
-
         if (currentBgIndex >= 0 || currentBlur) {
+            // Draw person
+            ctx.drawImage(results.image, 0, 0, width, height);
+
+            // Cut out person using mask
             ctx.globalCompositeOperation = 'destination-in';
 
             const isMobile = window.innerWidth < 768;
-
             if (!isMobile) {
-                // Geometric erosion (offset intersection) to remove whitish halo
-                // Only on PC. Skipped on mobile for performance/preference.
+                // Geometric erosion (PC only)
                 if (!maskCanvasRef.current) {
                     maskCanvasRef.current = document.createElement('canvas');
                 }
                 const maskCanvas = maskCanvasRef.current;
-                maskCanvas.width = width;
-                maskCanvas.height = height;
+                if (maskCanvas.width !== width) maskCanvas.width = width;
+                if (maskCanvas.height !== height) maskCanvas.height = height;
                 const mCtx = maskCanvas.getContext('2d');
 
-                // Draw original mask
+                mCtx.globalCompositeOperation = 'source-over';
                 mCtx.drawImage(results.segmentationMask, 0, 0, width, height);
 
-                // Intersect with shifted versions (erosion)
-                // Shift Left/Right/Down only. NOT Up (0, -offset), to preserve bottom edge.
                 mCtx.globalCompositeOperation = 'destination-in';
-                const offset = 2; // Approx 2px erosion
-                mCtx.drawImage(results.segmentationMask, -offset, 0, width, height); // Erodes Right
-                mCtx.drawImage(results.segmentationMask, offset, 0, width, height);  // Erodes Left
-                mCtx.drawImage(results.segmentationMask, 0, offset, width, height);  // Erodes Top
+                const offset = 2;
+                mCtx.drawImage(results.segmentationMask, -offset, 0, width, height);
+                mCtx.drawImage(results.segmentationMask, offset, 0, width, height);
+                mCtx.drawImage(results.segmentationMask, 0, offset, width, height);
 
-                // Use the eroded mask
                 ctx.drawImage(maskCanvas, 0, 0, width, height);
             } else {
-                // Mobile: Use original mask directly (no erosion)
+                // Mobile: Raw mask
                 ctx.drawImage(results.segmentationMask, 0, 0, width, height);
             }
-            ctx.filter = 'none';
-
-            ctx.globalCompositeOperation = 'destination-over';
-
-            if (currentBgIndex >= 0 && currentBgIndex < backgroundImagesRef.current.length) {
-                const bgImage = backgroundImagesRef.current[currentBgIndex];
-
-                // Calculate crop to maintain aspect ratio (cover)
-                const imgAspect = bgImage.width / bgImage.height;
-                const canvasAspect = width / height;
-                let sx, sy, sWidth, sHeight;
-
-                if (imgAspect > canvasAspect) {
-                    // Image is wider than canvas: crop sides
-                    sHeight = bgImage.height;
-                    sWidth = sHeight * canvasAspect;
-                    sy = 0;
-                    sx = (bgImage.width - sWidth) / 2;
-                } else {
-                    // Image is taller than canvas: crop top/bottom
-                    sWidth = bgImage.width;
-                    sHeight = sWidth / canvasAspect;
-                    sx = 0;
-                    sy = (bgImage.height - sHeight) / 2;
-                }
-
-                if (currentBlur) {
-                    ctx.filter = `blur(${BLUR_AMOUNT}px)`;
-                }
-                ctx.drawImage(bgImage, sx, sy, sWidth, sHeight, 0, 0, width, height);
-                ctx.filter = 'none';
-            } else if (currentBlur) {
-                ctx.filter = `blur(${BLUR_AMOUNT}px)`;
-                ctx.drawImage(results.image, 0, 0, width, height);
-                ctx.filter = 'none';
-            }
+        } else {
+            // No effects: Just clear foreground (background canvas shows camera feed)
+            // But to ensure the person is visible and aligned, we can just leave it clear
+            // or draw the camera feed again. 
+            // If we leave it clear, the background canvas (showing camera feed) is visible.
+            // BUT, if we want the "no effect" state to look exactly like the "effect" state (alignment-wise),
+            // it's safer to draw the camera feed here too.
+            ctx.drawImage(results.image, 0, 0, width, height);
         }
 
         ctx.restore();
@@ -307,9 +336,15 @@ function App() {
                             id="webcam"
                             autoPlay
                             playsInline
-                            style={{ display: 'none' }}
+                            style={{ position: 'absolute', opacity: 0, pointerEvents: 'none' }}
                         ></video>
-                        <canvas ref={canvasRef} id="outputCanvas"></canvas>
+                        {!videoLoaded && (
+                            <div className="video-loading">
+                                <img src="/user icon.png" alt="Loading" className="video-loading-icon" />
+                            </div>
+                        )}
+                        <canvas ref={bgCanvasRef} id="bgCanvas" style={{ position: 'absolute', top: 0, left: 0, zIndex: 1 }}></canvas>
+                        <canvas ref={canvasRef} id="outputCanvas" style={{ position: 'relative', zIndex: 2 }}></canvas>
                     </div>
 
                     <div className="controls-container">
